@@ -28,6 +28,64 @@ static int         mkdir_recursive(const char *path, mode_t mode);
 static int         do_merge(int file_count, char *files[], const char *output_name);
 static int         do_extract(const char *archive_path, const char *dir_name);
 
+
+int main(int argc, char *argv[])
+{
+    if (argc < 3) {
+        print_usage();
+        return 1;
+    }
+
+    if (strcmp(argv[1], "-b") == 0) {
+
+        char *input_files[MAX_INPUT_FILES];
+        int   file_count  = 0;
+        const char *output_name = "a.sau";
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-o") == 0) {
+                if (i + 1 < argc) {
+                    output_name = argv[++i];
+                } else {
+                    fprintf(stderr, "Hata: -o parametresinden sonra dosya adı belirtilmedi.\n");
+                    return 1;
+                }
+            } else {
+                if (file_count >= MAX_INPUT_FILES) {
+                    fprintf(stderr, "Hata: En fazla %d giriş dosyası desteklenir.\n",
+                            MAX_INPUT_FILES);
+                    return 1;
+                }
+                input_files[file_count++] = argv[i];
+            }
+        }
+
+        if (file_count == 0) {
+            fprintf(stderr, "Hata: Birleştirilecek dosya belirtilmedi.\n");
+            return 1;
+        }
+
+        return do_merge(file_count, input_files, output_name);
+
+    } else if (strcmp(argv[1], "-a") == 0) {
+
+        if (argc > 4) {
+            fprintf(stderr, "Hata: -a parametresinden sonra en fazla 2 argüman kabul edilir.\n");
+            return 1;
+        }
+
+        const char *archive_path = argv[2];
+        const char *dir_name     = (argc == 4) ? argv[3] : ".";
+
+        return do_extract(archive_path, dir_name);
+
+    } else {
+        print_usage();
+        return 1;
+    }
+}
+
+
 static void print_usage(void)
 {
     fprintf(stderr,
@@ -221,5 +279,206 @@ static int do_merge(int file_count, char *files[], const char *output_name)
     close(out_fd);
 
     printf("Dosyalar birleştirildi.\n");
+    return 0;
+}
+
+
+/* ======================== ACMA (-a) ======================== */
+static int do_extract(const char *archive_path, const char *dir_name)
+{
+    /* Adim 1: Arsiv dosyasini dogrula */
+    size_t path_len = strlen(archive_path);
+    if (path_len < 5 || strcmp(archive_path + path_len - 4, ".sau") != 0) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        return 0;
+    }
+
+    int arc_fd = open(archive_path, O_RDONLY);
+    if (arc_fd < 0) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        return 0;
+    }
+
+    /* Adim 2: 10 baytlik basligi oku */
+    char header[HEADER_SIZE + 1];
+    ssize_t n = read(arc_fd, header, HEADER_SIZE);
+    if (n != HEADER_SIZE) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        close(arc_fd);
+        return 0;
+    }
+    header[HEADER_SIZE] = '\0';
+
+    for (int i = 0; i < HEADER_SIZE; i++) {
+        if (!isdigit((unsigned char)header[i])) {
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+            close(arc_fd);
+            return 0;
+        }
+    }
+
+    size_t total_meta_size = (size_t)atol(header);
+    if (total_meta_size <= (size_t)HEADER_SIZE) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        close(arc_fd);
+        return 0;
+    }
+
+    /* Adim 3: Metadata kayitlarini oku ve ayristir */
+    size_t records_len = total_meta_size - HEADER_SIZE;
+    char  *meta_buf    = malloc(records_len + 1);
+    if (!meta_buf) {
+        perror("Bellek ayırma hatası");
+        close(arc_fd);
+        return 1;
+    }
+
+    n = read(arc_fd, meta_buf, records_len);
+    if (n != (ssize_t)records_len) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        free(meta_buf);
+        close(arc_fd);
+        return 0;
+    }
+    meta_buf[records_len] = '\0';
+
+    ArchiveEntry entries[MAX_INPUT_FILES];
+    int entry_count = 0;
+
+    char *p = meta_buf;
+    while (*p && entry_count < MAX_INPUT_FILES) {
+
+        while (*p && *p != '|') p++;
+        if (!*p) break;
+        p++;
+
+        char *end = strchr(p, '|');
+        if (!end || end == p) {
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+            free(meta_buf);
+            close(arc_fd);
+            return 0;
+        }
+
+        size_t rec_len = (size_t)(end - p);
+        char   record[PATH_MAX + 64];
+        if (rec_len >= sizeof(record)) {
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+            free(meta_buf);
+            close(arc_fd);
+            return 0;
+        }
+        memcpy(record, p, rec_len);
+        record[rec_len] = '\0';
+
+        char *fname_tok = strtok(record, ",");
+        char *perms_tok = strtok(NULL, ",");
+        char *fsize_tok = strtok(NULL, ",");
+
+        if (!fname_tok || !perms_tok || !fsize_tok) {
+            printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+            free(meta_buf);
+            close(arc_fd);
+            return 0;
+        }
+
+        strncpy(entries[entry_count].basename_str, fname_tok,
+                sizeof(entries[entry_count].basename_str) - 1);
+        entries[entry_count].basename_str[sizeof(entries[entry_count].basename_str) - 1] = '\0';
+
+        entries[entry_count].permissions = (mode_t)strtol(perms_tok, NULL, 8);
+        entries[entry_count].size        = (off_t)atoll(fsize_tok);
+
+        entry_count++;
+        p = end + 1;
+    }
+
+    free(meta_buf);
+
+    if (entry_count == 0) {
+        printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+        close(arc_fd);
+        return 0;
+    }
+
+    /* Adim 4: Cikis dizinini olustur */
+    if (strcmp(dir_name, ".") != 0) {
+        if (mkdir_recursive(dir_name, 0777) != 0) {
+            perror("Dizin oluşturulamadı");
+            close(arc_fd);
+            return 1;
+        }
+    }
+
+    /* Adim 5: Dosyalari cikar */
+    for (int i = 0; i < entry_count; i++) {
+
+        char out_path[PATH_MAX];
+        snprintf(out_path, sizeof(out_path), "%s/%s",
+                 dir_name, entries[i].basename_str);
+
+        int out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (out_fd < 0) {
+            perror(out_path);
+            close(arc_fd);
+            return 1;
+        }
+
+        off_t remaining = entries[i].size;
+        unsigned char buf[IO_BUFFER_SIZE];
+
+        while (remaining > 0) {
+            size_t  to_read    = ((size_t)remaining > IO_BUFFER_SIZE)
+                                     ? IO_BUFFER_SIZE
+                                     : (size_t)remaining;
+            ssize_t bytes_read = read(arc_fd, buf, to_read);
+
+            if (bytes_read <= 0) {
+                printf("Arşiv dosyası uygunsuz veya bozuk!\n");
+                close(out_fd);
+                close(arc_fd);
+                return 0;
+            }
+
+            ssize_t total_written = 0;
+            while (total_written < bytes_read) {
+                ssize_t w = write(out_fd, buf + total_written,
+                                  (size_t)(bytes_read - total_written));
+                if (w < 0) {
+                    perror("Dosya yazma hatası");
+                    close(out_fd);
+                    close(arc_fd);
+                    return 1;
+                }
+                total_written += w;
+            }
+
+            remaining -= bytes_read;
+        }
+
+        close(out_fd);
+
+        if (chmod(out_path, entries[i].permissions) != 0) {
+            perror("İzin ayarlama hatası");
+        }
+    }
+
+    close(arc_fd);
+
+    /* Adim 6: Basari mesajini yazdir */
+    printf("%s dizininde ", dir_name);
+
+    for (int i = 0; i < entry_count; i++) {
+        printf("%s", entries[i].basename_str);
+
+        if (i < entry_count - 2) {
+            printf(", ");
+        } else if (i == entry_count - 2) {
+            printf(" ve ");
+        }
+    }
+
+    printf(" dosyaları açıldı.\n");
+
     return 0;
 }
